@@ -198,6 +198,13 @@ fallback, so an existing registration keeps working.)
   restarted. Off by default: with the health endpoints, the usual deployment contract is
   that an orchestrator restarts the proxy, so a proxy that repairs itself by default
   would hide the failure. Ignored when `panicIfInvalid` is true, which keeps failing fast.
+  A downstream JSON-RPC `Session not found` error also marks the route unhealthy,
+  even if its subprocess and keepalive are still responsive. With `autoReconnect`
+  enabled, the gateway immediately rebuilds only that downstream (including a fresh
+  stdio subprocess for Agency bridges). Concurrent reports of the same failed
+  connection are coalesced. Failed rebuilds are retried on `pingInterval`.
+  The failed request is returned unchanged and is **never automatically replayed**:
+  a tool may have side effects, so verify its outcome before retrying a write.
 - `reconnectInterval` (duration string, default `"15s"`): gap between attempts while a
   downstream with `autoReconnect` is unreachable. Only meaningful with `autoReconnect`.
   It applies to the **startup** retry loop, not to a connection that drops later: a drop

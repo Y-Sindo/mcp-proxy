@@ -55,8 +55,10 @@ type Client struct {
 
 	// mu guards client. Forwarded calls resolve the live connection through
 	// getClient at request time, so reconnecting can swap it under them.
-	mu     sync.RWMutex
-	client *client.Client
+	mu             sync.RWMutex
+	client         *client.Client
+	sessionInvalid bool
+	sessionFailure chan struct{}
 
 	// connectMu serializes connect attempts: the startup retry loop and the
 	// ping-driven reconnect must never build a transport at the same time.
@@ -118,9 +120,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		return nil, pErr
 	}
 	c := &Client{
-		name:       name,
-		options:    conf.Options,
-		clientConf: clientInfo,
+		name:           name,
+		options:        conf.Options,
+		clientConf:     clientInfo,
+		sessionFailure: make(chan struct{}, 1),
 	}
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
@@ -299,7 +302,10 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 		return nil
 	})
 
+	c.mu.Lock()
+	c.sessionInvalid = false
 	c.health.Store(int32(healthOK))
+	c.mu.Unlock()
 	return nil
 }
 
@@ -344,7 +350,7 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 }
 
 // reconnect rebuilds a dropped downstream using the details remembered at
-// first connect. It is only called from the ping task.
+// first connect. The health task also handles session failures from requests.
 func (c *Client) reconnect(ctx context.Context) error {
 	return c.connect(ctx, c.clientInfo, c.mcpServer)
 }
@@ -472,7 +478,53 @@ func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mc
 	defer cancel()
 	request.Params.Meta = downstreamRequestMeta(request.Params.Meta)
 	result, err := cl.CallTool(callCtx, request)
+	c.observeSessionFailure(cl, err)
 	return result, redactURLCredentials(err)
+}
+
+// Agency forwards expired remote sessions as JSON-RPC errors over a healthy
+// stdio pipe. Match the exact message, not arbitrary tool output or a 404.
+func isSessionFailure(err error) bool {
+	for err != nil {
+		if strings.EqualFold(strings.TrimSpace(err.Error()), "Session not found") {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+func (c *Client) observeSessionFailure(cl *client.Client, err error) {
+	if !isSessionFailure(err) {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed.Load() || c.client != cl || c.sessionInvalid {
+		return
+	}
+	c.sessionInvalid = true
+	c.health.Store(int32(healthFailed))
+	slog.Warn("Downstream session invalid; failed request will not be replayed",
+		"client", c.name, "autoReconnect", c.options.autoReconnect())
+	select {
+	case c.sessionFailure <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) hasInvalidSession() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.sessionInvalid
+}
+
+func (c *Client) markProbeHealthy() {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if !c.sessionInvalid {
+		c.health.Store(int32(healthOK))
+	}
 }
 
 // drainStderr keeps reading a stdio subprocess's stderr for as long as it runs.
@@ -539,12 +591,15 @@ func (c *Client) probe(ctx context.Context) error {
 	}
 	if mcp.IsModernProtocol(cl.ProtocolVersion()) {
 		_, err := cl.ListTools(ctx, mcp.ListToolsRequest{})
+		c.observeSessionFailure(cl, err)
 		return err
 	}
 	// Ping is deprecated because it is a no-op on modern connections - which is
 	// exactly why probe() only reaches it on legacy ones. There is no
 	// replacement liveness call for servers older than 2026-07-28.
-	return cl.Ping(ctx) //nolint:staticcheck // intentional legacy fallback, see above
+	err := cl.Ping(ctx) //nolint:staticcheck // intentional legacy fallback, see above
+	c.observeSessionFailure(cl, err)
+	return err
 }
 
 // pingFailureThreshold is how many probes in a row have to fail before the
@@ -574,55 +629,69 @@ func (c *Client) startPingTask(ctx context.Context) {
 			slog.Debug("Context done, stopping ping", "client", c.name)
 			return
 		case <-ticker.C:
-			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-			err := c.probe(pingCtx)
-			cancel()
-			if ctx.Err() != nil {
-				return
-			}
-			if err == nil {
-				if failCount > 0 {
-					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
-					failCount = 0
-				}
-				c.health.Store(int32(healthOK))
-				continue
-			}
-			if !isTransportFailure(err) {
-				// A downstream that answers with a JSON-RPC error is alive - it
-				// may simply not implement the probe. Only a broken connection
-				// counts against it.
-				slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", redactURLCredentials(err))
-				if failCount > 0 {
-					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
-					failCount = 0
-				}
-				c.health.Store(int32(healthOK))
-				continue
-			}
-
-			failCount++
-			slog.Warn("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
-			if failCount < pingFailureThreshold {
-				continue
-			}
-			c.health.Store(int32(healthFailed))
-
-			if !autoReconnect {
-				continue
-			}
-			// Rebuild the downstream from scratch. connect() swaps the live
-			// transport in, so requests that arrive during the rebuild keep
-			// using the old one until the new one is ready.
-			rErr := c.reconnect(ctx)
-			if rErr != nil {
-				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
-				continue
-			}
-			slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
-			failCount = 0
-			c.health.Store(int32(healthOK))
+		case <-c.sessionFailure:
 		}
+		if c.closed.Load() || ctx.Err() != nil {
+			return
+		}
+		if c.hasInvalidSession() {
+			if autoReconnect {
+				if err := c.reconnect(ctx); err != nil {
+					slog.Warn("Failed to reconnect invalid downstream session", "client", c.name, "err", redactURLCredentials(err))
+				} else {
+					slog.Info("Reconnected invalid downstream session", "client", c.name)
+					failCount = 0
+				}
+			}
+			continue
+		}
+		pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+		err := c.probe(pingCtx)
+		cancel()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			if failCount > 0 {
+				slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+				failCount = 0
+			}
+			c.markProbeHealthy()
+			continue
+		}
+		if isSessionFailure(err) {
+			continue
+		}
+		if !isTransportFailure(err) {
+			// Other JSON-RPC errors (such as unsupported ping) still prove
+			// liveness; an invalid session is handled separately above.
+			slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", redactURLCredentials(err))
+			if failCount > 0 {
+				slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+				failCount = 0
+			}
+			c.markProbeHealthy()
+			continue
+		}
+
+		failCount++
+		slog.Warn("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
+		if failCount < pingFailureThreshold {
+			continue
+		}
+		c.health.Store(int32(healthFailed))
+
+		if !autoReconnect {
+			continue
+		}
+		rErr := c.reconnect(ctx)
+		if rErr != nil {
+			slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
+			continue
+		}
+		slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
+		failCount = 0
+		c.markProbeHealthy()
 	}
 }
 
@@ -767,6 +836,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 				defer cancel()
 				request.Params.Meta = downstreamRequestMeta(request.Params.Meta)
 				result, err := live.GetPrompt(callCtx, request)
+				c.observeSessionFailure(live, err)
 				return result, redactURLCredentials(err)
 			}})
 		}
@@ -871,6 +941,7 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 	defer cancel()
 	request.Params.Meta = downstreamRequestMeta(request.Params.Meta)
 	readResource, err := cl.ReadResource(callCtx, request)
+	c.observeSessionFailure(cl, err)
 	if err != nil {
 		return nil, redactURLCredentials(err)
 	}
