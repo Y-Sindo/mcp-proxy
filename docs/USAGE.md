@@ -11,10 +11,16 @@
 -authorize string      run a one-time interactive OAuth authorization for the
                         named mcpServers entry, then exit
 -check-config          load and validate the config, then exit
+-stdio-route string    bridge stdio to the named route on the local MCP Gateway
 -log-level value       log level: debug, info, warn, or error (default info)
 -version               print version and exit
 -help                  print help and exit
 ```
+
+`-stdio-route NAME` connects to `http://127.0.0.1:19090/NAME/mcp` using
+`MCP_PROXY_TOKEN` as a bearer token. It does not load a config file or start
+another HTTP listener. Only the stdio connection advertises legacy MCP versions;
+the HTTP connection negotiates independently.
 
 ## Validating configuration
 
